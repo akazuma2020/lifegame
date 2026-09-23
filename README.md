@@ -14,6 +14,8 @@ SBCL + wgpu-native で動く、20,000 x 20,000セルの Conway's Game of Life �
 の順に読むと、CPUからGPUへ処理が渡る流れを追いやすくなります。
 主要ソースには自分の理解のためにかなり冗長なコメントをつけています。
 
+比較のため、同等機能を chrome で動かすための test_chrome.html、test_chrome.js も入れてあります。
+
 ## 必要環境
 
 共通で、64-bit版SBCL、Quicklisp、Quicklispパッケージの`cffi`、`sdl2`、`bordeaux-threads`、
@@ -42,10 +44,8 @@ unzip clock-snapshot-ampm.zip
 
 ### WSLでのビルドと起動
 
-次の手順でビルドして起動します。
-
 ```sh
-cd bridge
+cd ./bridge
 sh build.sh
 cd ..
 sbcl --load lifegame.lisp
@@ -54,8 +54,8 @@ sbcl --load lifegame.lisp
 ### Windowsでのビルドと起動
 
 ```bat
-cd bridge
-build-msvc.bat
+cd ./bridge
+build.bat
 cd ..
 sbcl --load lifegame.lisp
 ```
