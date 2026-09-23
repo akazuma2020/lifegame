@@ -1,0 +1,4 @@
+*.bat text eol=crlf
+*.c linguist-vendored
+*.js linguist-vendored
+*.html linguist-vendored
