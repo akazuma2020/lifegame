@@ -1,10 +1,10 @@
 # WGPU Life 20000²
 
-WSL環境の SBCL + wgpu-native で動く、20,000 x 20,000セルの Conway's Game of Life の実験です。
+SBCL + wgpu-native で動く、20,000 x 20,000セルの Conway's Game of Life の実験です。
 本プロジェクトは、OpenAI Codex の支援を受けて開発しました。
 
-初期配置には [Code Golf投稿のデジタル時計](https://codegolf.stackexchange.com/a/111932)
-（10,016 x 6,796、B3/S23）を使います。元GistのRLEを `clock.rle` として同梱しています。
+初期配置には [AM/PM両対応デジタル時計](https://codegolf.stackexchange.com/questions/88783/build-a-digital-clock-in-conways-game-of-life)
+（10,284 x 6,796、B3/S23）を改造したものを使います。
 
 ## 構成図
 
@@ -16,28 +16,46 @@ WSL環境の SBCL + wgpu-native で動く、20,000 x 20,000セルの Conway's Ga
 
 ## 必要環境
 
-- WSL2 + WSLg。既定のSDLビデオドライバはX11です。
-- WSLのGPUアクセラレーションに対応したハードウェアGPUとWindows側ドライバ。
-- SBCL、Quicklisp、Quicklispパッケージの`cffi`、`sdl2`、`bordeaux-threads`。
-- C11対応Cコンパイラ、SDL2の開発用ヘッダーとライブラリ。
-- wgpu-nativeの`webgpu/wgpu.h`と`libwgpu_native.so`。現在のビルドスクリプトはライブラリを`/usr/local/lib`から読みます。
-- WSLが提供する`/usr/lib/wsl/lib/libd3d12core.so`と`/usr/lib/wsl/lib/libd3d12.so`。
+共通で、64-bit版SBCL、Quicklisp、Quicklispパッケージの`cffi`、`sdl2`、`bordeaux-threads`、
+SDL2、wgpu-native、およびWebGPU対応のハードウェアGPUが必要です。
+
+### WSL
+
+- WSLではWSLgとWindows側GPUドライバ。SDL video driverの既定値はX11です。
+- `/usr/lib/wsl/lib/libd3d12core.so`と`libd3d12.so`は、存在する場合だけLisp側が
+  先にloadします。通常のLinuxでは要求しません。
+
+### Windows
+
+- SDL2 と wgpu-native は MSYS2 UCRT64 のもので動作確認しています。
+- bridge.c ビルドには MSYS2 MinGW を使用して動作確認しています。
 
 ## 起動
 
 初回起動前に、リポジトリ直下でスナップショットを解凍します。
 
 ```sh
-unzip clock-snapshot.zip
+unzip clock-snapshot-ampm.zip
 ```
 
-解凍すると、`clock-snapshot/`に10分刻みのRLEファイルが144枚作られます。
+解凍すると、`clock-snapshot-ampm/`に10分刻みRLEが144枚作られます。
 
-その後、次の手順でビルドして起動します。
+### WSLでのビルドと起動
+
+次の手順でビルドして起動します。
 
 ```sh
 cd bridge
 sh build.sh
+cd ..
+sbcl --load lifegame.lisp
+```
+
+### Windowsでのビルドと起動
+
+```bat
+cd bridge
+build-msvc.bat
 cd ..
 sbcl --load lifegame.lisp
 ```
@@ -80,6 +98,7 @@ LIFEGAME_NO_AUTOSTART=1 sbcl --load lifegame.lisp
 | `Space` | 実行・一時停止 |
 | `Right` | 一時停止して1世代進める |
 | `Up` / `Down` | targetを次 / 前の速度段階へ変更 |
+| `V` | 表示方式をFIFO（VSyncあり）/ Immediate（VSyncなし）で切替 |
 | `F` | 20,000 x 20,000の全景に戻す |
 | `R` | 起動時に読み込んだ配置へ戻して一時停止 |
 | `Esc` | 終了 |
@@ -88,6 +107,11 @@ LIFEGAME_NO_AUTOSTART=1 sbcl --load lifegame.lisp
 単位はgen/sです。
 `fps`には直近約1秒の描画フレーム数を表示します。1フレームの最大更新は
 256世代に制限し、ウィンドウ操作が長時間固まるのを避けています。
+タイトルには現在の表示方式も`FIFO`または`IMMEDIATE`として表示します。
+既定のFIFOはティアリングを防ぎます。Immediateは垂直同期を待たないため性能測定に
+向きますが、画面が途中でずれて見える場合があります。SurfaceがImmediateに未対応なら
+FIFOへ自動的に戻し、ターミナルへ通知します。起動時からImmediateにする場合は
+`(lifegame::main :present-mode :immediate)`を使用できます。
 `target`は1～5 gen/sでは
 1刻み、その後は10～300 gen/sまで10刻みで選択できます。実時間の時計速度に対応する
 192 gen/sも追加段階として含まれます。ローカル時刻同期での起動時は192 gen/s、

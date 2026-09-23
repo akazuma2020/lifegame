@@ -16,15 +16,53 @@
  */
 
 #include <webgpu/wgpu.h>
+
+/*
+ * SDL2の公式Windows開発パッケージはinclude直下にSDL.hを置く。一方、
+ * Debian/UbuntuはSDL2/SDL.hとしてインストールするため、OSごとに分ける。
+ */
+#if defined(_WIN32)
+#ifndef SDL_MAIN_HANDLED
+#define SDL_MAIN_HANDLED
+#endif
+/*
+ * MSYS2のSDL2 headerはMinGW向けSDL_config.hを同梱し、MSVCには存在しない
+ * strings.hとGCC atomic builtinsを有効にしている。SDL headerより先にconfigを
+ * 一度読み、MSVCで非互換な項目だけを解除する。SDL2.dllのABIには影響しない。
+ */
+#if defined(_MSC_VER)
+#include <SDL_config.h>
+#ifdef HAVE_STRINGS_H
+#undef HAVE_STRINGS_H
+#endif
+#ifdef HAVE_GCC_ATOMICS
+#undef HAVE_GCC_ATOMICS
+#endif
+#ifdef HAVE_GCC_SYNC_LOCK_TEST_AND_SET
+#undef HAVE_GCC_SYNC_LOCK_TEST_AND_SET
+#endif
+#endif
+#include <SDL.h>
+#include <SDL_syswm.h>
+#else
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_syswm.h>
+#endif
 
 #include <stdbool.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Lisp/CFFIから呼ぶ9関数をWindows DLLのexport tableへ公開する。 */
+#if defined(_WIN32) && !defined(LIFE_SHADER_VALIDATE)
+#define LIFE_API __declspec(dllexport)
+#elif defined(__GNUC__) || defined(__clang__)
+#define LIFE_API __attribute__((visibility("default")))
+#else
+#define LIFE_API
+#endif
 
 /* -------------------- 盤面サイズとGPUバッファの大きさ -------------------- */
 #define GRID_WIDTH 20000u
@@ -66,11 +104,28 @@ typedef struct {
     WGPUBindGroup step_eight_groups[2];
     WGPUBindGroup clear_groups[2];
     uint32_t current;
+    WGPUPresentMode present_mode;
+    bool immediate_supported;
 } LifeState;
 
-/* AdapterはGPU候補、Deviceは選ばれたGPUへ命令を出す入口。取得は非同期で行われる。 */
-typedef struct { WGPUAdapter adapter; atomic_bool done; } AdapterRequest;
-typedef struct { WGPUDevice device; atomic_bool done; } DeviceRequest;
+/*
+ * AdapterはGPU候補、Deviceは選ばれたGPUへ命令を出す入口。取得は非同期で行われる。
+ * MSVCはC11 stdatomic.hの対応状況が版によって異なる。既に依存しているSDL2の
+ * atomicを使えば、GCC/MSVCの両方でcallbackと待機側を安全に同期できる。
+ */
+typedef SDL_atomic_t LifeAtomicBool;
+typedef struct { WGPUAdapter adapter; LifeAtomicBool done; } AdapterRequest;
+typedef struct { WGPUDevice device; LifeAtomicBool done; } DeviceRequest;
+
+static bool life_atomic_load(LifeAtomicBool *value)
+{
+    return SDL_AtomicGet(value) != 0;
+}
+
+static void life_atomic_store(LifeAtomicBool *value, bool state)
+{
+    SDL_AtomicSet(value, state ? 1 : 0);
+}
 
 static WGPUStringView sv(const char *text)
 {
@@ -86,20 +141,20 @@ static void adapter_callback(WGPURequestAdapterStatus status, WGPUAdapter adapte
     AdapterRequest *request = userdata1;
     (void)message; (void)userdata2;
     if (status == WGPURequestAdapterStatus_Success) request->adapter = adapter;
-    atomic_store(&request->done, true);
+    life_atomic_store(&request->done, true);
 }
 
 static void device_callback(WGPURequestDeviceStatus status, WGPUDevice device,
                             WGPUStringView message, void *userdata1, void *userdata2)
 {
-    /* Device作成完了の通知。atomic_boolなら別スレッドから安全に読み書きできる。 */
+    /* Device作成完了の通知。SDL atomicなら別スレッドから安全に読み書きできる。 */
     DeviceRequest *request = userdata1;
     (void)message; (void)userdata2;
     if (status == WGPURequestDeviceStatus_Success) request->device = device;
-    atomic_store(&request->done, true);
+    life_atomic_store(&request->done, true);
 }
 
-WGPUInstance WGPU_CreateInstance(int allow_noncompliant)
+LIFE_API WGPUInstance WGPU_CreateInstance(int allow_noncompliant)
 {
     /* InstanceはWebGPU利用全体の出発点。WSLのDozenも候補に含められる設定を足す。 */
     WGPUInstanceExtras extras = {0};
@@ -111,17 +166,30 @@ WGPUInstance WGPU_CreateInstance(int allow_noncompliant)
     return wgpuCreateInstance(&descriptor);
 }
 
-WGPUSurface WGPU_InitSurface(WGPUInstance instance, SDL_Window *window)
+LIFE_API WGPUSurface WGPU_InitSurface(WGPUInstance instance, SDL_Window *window)
 {
     /*
      * Surfaceは「GPUの絵を表示するウィンドウ」との接続口。
-     * SDLからOS固有情報を取り出し、X11かWaylandに合う部品をWebGPUへ渡す。
+     * SDLからOS固有情報を取り出し、Win32、X11、Waylandのいずれかに合う
+     * 部品をWebGPUへ渡す。使えないunion memberはプリプロセッサで除外する。
      */
     if (!instance || !window) return NULL;
     SDL_SysWMinfo wm;
     SDL_VERSION(&wm.version);
     if (!SDL_GetWindowWMInfo(window, &wm)) return NULL;
 
+#if defined(SDL_VIDEO_DRIVER_WINDOWS)
+    if (wm.subsystem == SDL_SYSWM_WINDOWS) {
+        WGPUSurfaceSourceWindowsHWND source = {
+            .chain = { .sType = WGPUSType_SurfaceSourceWindowsHWND },
+            .hinstance = wm.info.win.hinstance,
+            .hwnd = wm.info.win.window
+        };
+        WGPUSurfaceDescriptor descriptor = { .nextInChain = &source.chain };
+        return wgpuInstanceCreateSurface(instance, &descriptor);
+    }
+#endif
+#if defined(SDL_VIDEO_DRIVER_X11)
     if (wm.subsystem == SDL_SYSWM_X11) {
         WGPUSurfaceSourceXlibWindow source = {
             .chain = { .sType = WGPUSType_SurfaceSourceXlibWindow },
@@ -131,6 +199,8 @@ WGPUSurface WGPU_InitSurface(WGPUInstance instance, SDL_Window *window)
         WGPUSurfaceDescriptor descriptor = { .nextInChain = &source.chain };
         return wgpuInstanceCreateSurface(instance, &descriptor);
     }
+#endif
+#if defined(SDL_VIDEO_DRIVER_WAYLAND)
     if (wm.subsystem == SDL_SYSWM_WAYLAND) {
         WGPUSurfaceSourceWaylandSurface source = {
             .chain = { .sType = WGPUSType_SurfaceSourceWaylandSurface },
@@ -140,6 +210,7 @@ WGPUSurface WGPU_InitSurface(WGPUInstance instance, SDL_Window *window)
         WGPUSurfaceDescriptor descriptor = { .nextInChain = &source.chain };
         return wgpuInstanceCreateSurface(instance, &descriptor);
     }
+#endif
     return NULL;
 }
 
@@ -268,7 +339,7 @@ static WGPUBindGroup make_render_group(WGPUDevice device,
     return wgpuDeviceCreateBindGroup(device, &descriptor);
 }
 
-void WGPU_ReleaseLife(LifeState *state)
+LIFE_API void WGPU_ReleaseLife(LifeState *state)
 {
     /*
      * 作成したGPU資源をすべて解放する。NULLか確認するため、初期化途中の失敗にも使える。
@@ -293,10 +364,13 @@ void WGPU_ReleaseLife(LifeState *state)
     free(state);
 }
 
-WGPUDevice WGPU_InitLife(WGPUInstance instance, WGPUSurface surface,
-                         const char *shader_code, const uint32_t *initial_words,
-                         uint64_t word_count, const uint32_t *initial_tiles,
-                         uint32_t initial_tile_count, LifeState **out_state)
+LIFE_API WGPUDevice WGPU_InitLife(WGPUInstance instance, WGPUSurface surface,
+                                  const char *shader_code,
+                                  const uint32_t *initial_words,
+                                  uint64_t word_count,
+                                  const uint32_t *initial_tiles,
+                                  uint32_t initial_tile_count,
+                                  LifeState **out_state)
 {
     /* -------------------- GPU側のLife実行環境を組み立てる --------------------
      * 戻り値はDevice、out_stateにはそのDeviceで作った全資源の一覧を返す。
@@ -319,7 +393,7 @@ WGPUDevice WGPU_InitLife(WGPUInstance instance, WGPUSurface surface,
     };
     wgpuInstanceRequestAdapter(instance, &options, adapter_info);
     /* callbackがdoneを立てるまで、SDL_DelayでCPUを休ませながら待つ。 */
-    while (!atomic_load(&adapter_request.done)) SDL_Delay(1);
+    while (!life_atomic_load(&adapter_request.done)) SDL_Delay(1);
     if (!adapter_request.adapter) return NULL;
 
     /* 選ばれたGPU名をログへ出し、CPUだけで動く遅いsoftware adapterは拒否する。 */
@@ -339,6 +413,20 @@ WGPUDevice WGPU_InitLife(WGPUInstance instance, WGPUSurface surface,
         }
     }
 
+    /* Surfaceごとに利用可能な表示方式は異なる。FIFOは必須だがImmediateは任意。 */
+    bool immediate_supported = false;
+    WGPUSurfaceCapabilities surface_capabilities = {0};
+    if (wgpuSurfaceGetCapabilities(surface, adapter_request.adapter,
+                                   &surface_capabilities) == WGPUStatus_Success) {
+        for (size_t i = 0; i < surface_capabilities.presentModeCount; i++) {
+            if (surface_capabilities.presentModes[i] == WGPUPresentMode_Immediate) {
+                immediate_supported = true;
+                break;
+            }
+        }
+        wgpuSurfaceCapabilitiesFreeMembers(surface_capabilities);
+    }
+
     /* 2. Adapterから、実際にpipelineやbufferを作るDeviceを取得する。 */
     DeviceRequest device_request = {0};
     WGPUDeviceDescriptor device_descriptor = {0};
@@ -347,7 +435,7 @@ WGPUDevice WGPU_InitLife(WGPUInstance instance, WGPUSurface surface,
         .mode = WGPUCallbackMode_AllowSpontaneous
     };
     wgpuAdapterRequestDevice(adapter_request.adapter, &device_descriptor, device_info);
-    while (!atomic_load(&device_request.done)) SDL_Delay(1);
+    while (!life_atomic_load(&device_request.done)) SDL_Delay(1);
     wgpuAdapterRelease(adapter_request.adapter);
     if (!device_request.device) return NULL;
 
@@ -465,6 +553,8 @@ WGPUDevice WGPU_InitLife(WGPUInstance instance, WGPUSurface surface,
 
     /* すべて成功。最初はcells[0]を現在面としてLispへstateを返す。 */
     state->current = 0;
+    state->present_mode = WGPUPresentMode_Fifo;
+    state->immediate_supported = immediate_supported;
     *out_state = state;
     return device;
 
@@ -480,12 +570,41 @@ fail:
     return NULL;
 }
 
-int WGPU_UpdateSurface(WGPUDevice device, WGPUSurface surface,
-                       uint32_t width, uint32_t height)
+static int configure_surface(WGPUDevice device, WGPUSurface surface,
+                             LifeState *state, uint32_t width, uint32_t height,
+                             uint32_t request_immediate)
 {
     /*
      * ウィンドウの大きさに合わせ、表示用画像の交換列（swapchain相当）を設定する。
      * Fifoは垂直同期に合わせて順番に表示し、画面の途中で絵が切れるのを防ぐ。
+     * Immediateは垂直同期を待たない。未対応環境で要求された場合はFIFOへ戻し、
+     * 戻り値1でLisp側へ知らせる。
+     */
+    if (!device || !surface || !state || !width || !height || request_immediate > 1u)
+        return -1;
+    bool fell_back = request_immediate && !state->immediate_supported;
+    WGPUPresentMode present_mode = request_immediate && !fell_back
+        ? WGPUPresentMode_Immediate : WGPUPresentMode_Fifo;
+    WGPUSurfaceConfiguration config = {
+        .device = device,
+        .format = WGPUTextureFormat_BGRA8Unorm,
+        .usage = WGPUTextureUsage_RenderAttachment,
+        .presentMode = present_mode,
+        .width = width,
+        .height = height,
+        .alphaMode = WGPUCompositeAlphaMode_Opaque
+    };
+    wgpuSurfaceConfigure(surface, &config);
+    state->present_mode = present_mode;
+    return fell_back ? 1 : 0;
+}
+
+LIFE_API int WGPU_UpdateSurface(WGPUDevice device, WGPUSurface surface,
+                                uint32_t width, uint32_t height)
+{
+    /*
+     * 旧版と同じ4引数ABIを保つ互換入口。古いLispからは従来どおりFIFOで設定する。
+     * present modeを選ぶ新しいLispはWGPU_SetPresentModeを使う。
      */
     if (!device || !surface || !width || !height) return -1;
     WGPUSurfaceConfiguration config = {
@@ -501,9 +620,20 @@ int WGPU_UpdateSurface(WGPUDevice device, WGPUSurface surface,
     return 0;
 }
 
-void WGPU_ResetLife(WGPUQueue queue, LifeState *state,
-                    const uint32_t *initial_words, uint64_t word_count,
-                    const uint32_t *initial_tiles, uint32_t initial_tile_count)
+LIFE_API int WGPU_SetPresentMode(WGPUDevice device, WGPUSurface surface,
+                                 LifeState *state, uint32_t width, uint32_t height,
+                                 uint32_t request_immediate)
+{
+    /* 新機能を別symbolにし、新旧DLLを混ぜても引数ずれでメモリを壊さないようにする。 */
+    return configure_surface(device, surface, state, width, height,
+                             request_immediate);
+}
+
+LIFE_API void WGPU_ResetLife(WGPUQueue queue, LifeState *state,
+                             const uint32_t *initial_words,
+                             uint64_t word_count,
+                             const uint32_t *initial_tiles,
+                             uint32_t initial_tile_count)
 {
     /* Rキー用。GPU資源は作り直さず、2枚の内容と候補数だけを初期状態へ戻す。 */
     if (!queue || !state || !initial_words || word_count != WORD_COUNT ||
@@ -562,8 +692,9 @@ static bool encode_step(WGPUCommandEncoder encoder, LifeState *state,
     return true;
 }
 
-int WGPU_AdvanceLife(WGPUDevice device, WGPUQueue queue, LifeState *state,
-                     uint32_t steps, uint32_t sparse_mode)
+LIFE_API int WGPU_AdvanceLife(WGPUDevice device, WGPUQueue queue,
+                              LifeState *state, uint32_t steps,
+                              uint32_t sparse_mode)
 {
     /* -------------------- 画面を出さずに時計を早送りする --------------------
      * 起動時は、デジタル時計をシステムのローカル時刻まで進める。
@@ -619,10 +750,11 @@ fail:
     return -1;
 }
 
-int WGPU_DrawLife(WGPUDevice device, WGPUQueue queue, WGPUSurface surface,
-                  LifeState *state, float width, float height,
-                  float center_x, float center_y, float zoom,
-                  uint32_t steps, uint32_t sparse_mode)
+LIFE_API int WGPU_DrawLife(WGPUDevice device, WGPUQueue queue,
+                           WGPUSurface surface, LifeState *state,
+                           float width, float height, float center_x,
+                           float center_y, float zoom, uint32_t steps,
+                           uint32_t sparse_mode)
 {
     /* -------------------- 世代更新と画面描画を1フレーム分まとめる -------------------- */
     if (!device || !queue || !surface || !state) return -1;
@@ -645,7 +777,9 @@ int WGPU_DrawLife(WGPUDevice device, WGPUQueue queue, WGPUSurface surface,
     if (surface_texture.status == WGPUSurfaceGetCurrentTextureStatus_Outdated ||
         surface_texture.status == WGPUSurfaceGetCurrentTextureStatus_Lost) {
         if (surface_texture.texture) wgpuTextureRelease(surface_texture.texture);
-        WGPU_UpdateSurface(device, surface, (uint32_t)width, (uint32_t)height);
+        configure_surface(device, surface, state,
+                          (uint32_t)width, (uint32_t)height,
+                          state->present_mode == WGPUPresentMode_Immediate ? 1u : 0u);
         return 1;
     }
     if (!surface_texture.texture)
@@ -722,7 +856,7 @@ fail_frame:
  * 検証では、同じ小さな盤面をCPUとGPUの両方で8世代進め、全ビットが同じか比較する。
  * 「pipelineを作れた」だけでなく「実際の計算結果が正しい」ことまで確かめる。
  */
-typedef struct { atomic_bool done; WGPUMapAsyncStatus status; } BufferMapRequest;
+typedef struct { LifeAtomicBool done; WGPUMapAsyncStatus status; } BufferMapRequest;
 
 static void map_callback(WGPUMapAsyncStatus status, WGPUStringView message,
                          void *userdata1, void *userdata2)
@@ -731,7 +865,7 @@ static void map_callback(WGPUMapAsyncStatus status, WGPUStringView message,
     BufferMapRequest *request = userdata1;
     (void)message; (void)userdata2;
     request->status = status;
-    atomic_store(&request->done, true);
+    life_atomic_store(&request->done, true);
 }
 
 static void cpu_life(const uint32_t *input, uint32_t *output,
@@ -952,7 +1086,7 @@ int main(int argc, char **argv)
         .mode = WGPUCallbackMode_AllowSpontaneous
     };
     wgpuInstanceRequestAdapter(instance, &options, adapter_info);
-    while (!atomic_load(&adapter_request.done)) SDL_Delay(1);
+    while (!life_atomic_load(&adapter_request.done)) SDL_Delay(1);
     if (!adapter_request.adapter) return 3;
     DeviceRequest device_request = {0};
     WGPUDeviceDescriptor device_descriptor = {0};
@@ -961,7 +1095,7 @@ int main(int argc, char **argv)
         .mode = WGPUCallbackMode_AllowSpontaneous
     };
     wgpuAdapterRequestDevice(adapter_request.adapter, &device_descriptor, device_info);
-    while (!atomic_load(&device_request.done)) SDL_Delay(1);
+    while (!life_atomic_load(&device_request.done)) SDL_Delay(1);
     if (!device_request.device) return 3;
 
     /* まず4本のpipelineを作り、WGSLの文法とbindingが妥当か確認する。 */
@@ -1097,7 +1231,8 @@ int main(int argc, char **argv)
             .callback = map_callback, .userdata1 = &map
         };
         wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, test_bytes * 3u, map_info);
-        while (!atomic_load(&map.done)) wgpuDevicePoll(device_request.device, true, NULL);
+        while (!life_atomic_load(&map.done))
+            wgpuDevicePoll(device_request.device, true, NULL);
         const uint32_t *gpu = wgpuBufferGetConstMappedRange(staging, 0, test_bytes * 3u);
         ok = map.status == WGPUMapAsyncStatus_Success && gpu &&
              memcmp(gpu, cpu_a, test_bytes) == 0 &&

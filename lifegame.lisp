@@ -1,4 +1,12 @@
-(ql:quickload '(:cffi :sdl2 :bordeaux-threads))
+(ql:quickload :cffi)
+
+;; 実行時ライブラリはOSの標準ローダー検索経路から解決する。
+;; プロジェクト内のbridge/や環境固有のSDL2ディレクトリは検索対象に加えない。
+(defparameter cl-user::*lifegame-bootstrap-source-directory*
+  (uiop:pathname-directory-pathname
+   (or *load-truename* *compile-file-truename*)))
+
+(ql:quickload '(:sdl2 :bordeaux-threads))
 
 ;;;; WGPU Lifeの制御側
 ;;;;
@@ -12,8 +20,7 @@
 (in-package :lifegame)
 
 (defparameter *source-directory*
-  (uiop:pathname-directory-pathname
-   (or *load-truename* *compile-file-truename*)))
+  cl-user::*lifegame-bootstrap-source-directory*)
 
 ;;; -------------------- 表示・更新・時計の定数 --------------------
 (defconstant +max-steps-per-frame+ 256)
@@ -37,22 +44,37 @@
 (defconstant +clock-correction-seconds+ 300)
 
 (defparameter *clock-url*
-  "https://gist.githubusercontent.com/anonymous/f3413564b1fa9c69f2bad4b0400b8090/raw/f5c77c999a8e11f0ec6ba504d383774eb3b88e5c/Conway%2520life%2520clock%2520PM%2520only")
-(defparameter *clock-path* (merge-pathnames "clock.rle" *source-directory*))
+  "https://gist.githubusercontent.com/anonymous/9d7468755dd76a35d93beeb5c0a5bdcf/raw/3295717faf24e8911048bcb69d4b6c8505d24330/gistfile1.txt")
+(defparameter *clock-path* (merge-pathnames "clock-ampm.rle" *source-directory*))
 (defparameter *clock-snapshot-directory*
-  (merge-pathnames "clock-snapshot/" *source-directory*))
+  (merge-pathnames "clock-snapshot-ampm/" *source-directory*))
 
+(defparameter *windows-platform-p* (uiop:os-windows-p))
 (defparameter *video-driver*
-  (or (uiop:getenv "LIFEGAME_SDL_VIDEODRIVER") "x11"))
-(setf (uiop:getenv "SDL_VIDEODRIVER") *video-driver*
-      (uiop:getenv "RUST_BACKTRACE") "full")
+  (or (uiop:getenv "LIFEGAME_SDL_VIDEODRIVER")
+      ;; WSLではWaylandより検証済みのX11を既定にする。Windowsネイティブでは
+      ;; SDL自身にWin32 driverを選ばせるため、環境変数を設定しない。
+      (unless *windows-platform-p* "x11")))
+(when *video-driver*
+  (setf (uiop:getenv "SDL_VIDEODRIVER") *video-driver*))
+(setf (uiop:getenv "RUST_BACKTRACE") "full")
 
 ;;; -------------------- C bridgeとの接続 --------------------
-(cffi:load-foreign-library "/usr/lib/wsl/lib/libd3d12core.so")
-(cffi:load-foreign-library "/usr/lib/wsl/lib/libd3d12.so")
-(cffi:load-foreign-library "libwgpu_native.so")
-(cffi:load-foreign-library
- (merge-pathnames "bridge/bridge.so" *source-directory*))
+(if *windows-platform-p*
+    (progn
+      ;; DLLはWindowsの標準DLL検索経路から名前だけで解決する。
+      (cffi:load-foreign-library "wgpu_native.dll")
+      (cffi:load-foreign-library "bridge/bridge.dll"))
+    (progn
+      ;; WSL固有のD3D12 libraryは存在するときだけ先にloadする。これにより
+      ;; 同じソースを通常のLinuxでもloadできる。
+      (dolist (path '("/usr/lib/wsl/lib/libd3d12core.so"
+                      "/usr/lib/wsl/lib/libd3d12.so"))
+        (when (probe-file path)
+          (cffi:load-foreign-library path)))
+      ;; 共有ライブラリはOSの標準検索経路から名前だけで解決する。
+      (cffi:load-foreign-library "libwgpu_native.so")
+      (cffi:load-foreign-library "bridge/bridge.so")))
 
 (cffi:defcfun ("WGPU_CreateInstance" %create-instance) :pointer
   (allow-noncompliant :int))
@@ -64,7 +86,11 @@
   (initial-active-tiles :pointer) (initial-tile-count :uint32)
   (out-state :pointer))
 (cffi:defcfun ("WGPU_UpdateSurface" update-surface) :int
-  (device :pointer) (surface :pointer) (width :uint32) (height :uint32))
+  (device :pointer) (surface :pointer)
+  (width :uint32) (height :uint32))
+(cffi:defcfun ("WGPU_SetPresentMode" set-present-mode) :int
+  (device :pointer) (surface :pointer) (state :pointer)
+  (width :uint32) (height :uint32) (request-immediate :uint32))
 (cffi:defcfun ("WGPU_AdvanceLife" advance-life) :int
   (device :pointer) (queue :pointer) (state :pointer)
   (steps :uint32) (sparse-mode :uint32))
@@ -102,9 +128,13 @@
     110.0d0 120.0d0 130.0d0 140.0d0 150.0d0
     160.0d0 170.0d0 180.0d0 190.0d0 192.0d0 200.0d0
     210.0d0 220.0d0 230.0d0 240.0d0 250.0d0
-    260.0d0 270.0d0 280.0d0 290.0d0 300.0d0))
+    260.0d0 270.0d0 280.0d0 290.0d0 300.0d0
+    400.0d0 500.0d0 600.0d0 700.0d0 800.0d0 900.0d0 1000.0d0
+    2000.0d0 3000.0d0 4000.0d0 5000.0d0
+    6000.0d0 7000.0d0 8000.0d0 9000.0d0 10000.0d0))
 (defparameter *initial-speed* 50.0d0)
 (defparameter *sparse-mode* t)
+(defparameter *present-mode* :fifo)
 (defparameter *sync-to-local-time* t)
 (defvar *main-thread* nil)
 (defparameter *auto-start*
@@ -238,8 +268,24 @@
                *speed-levels* :from-end t)
       (aref *speed-levels* 0)))
 
+(defun configure-surface (device surface state width height present-mode)
+  "Configure the surface and return the mode actually selected by wgpu-native."
+  (unless (member present-mode '(:fifo :immediate))
+    (error "Unknown present mode: ~S" present-mode))
+  (let ((result (set-present-mode device surface state width height
+                                  (if (eq present-mode :immediate) 1 0))))
+    (when (minusp result)
+      (error "Configure surface failed"))
+    (if (plusp result)
+        (progn
+          (format t "~&Immediate present mode is unavailable; using FIFO.~%")
+          (finish-output)
+          :fifo)
+        present-mode)))
+
 ;;; -------------------- SDLイベントループ --------------------
-(defun main (&key frame-limit (sync-to-local-time *sync-to-local-time*))
+(defun main (&key frame-limit (sync-to-local-time *sync-to-local-time*)
+                  (present-mode *present-mode*))
   (let* ((startup-time (get-universal-time))
          ;; 時刻同期時は直前の10分のRLE、同期無効時は従来の初期RLEを読む。
          (source-info (if sync-to-local-time
@@ -328,8 +374,9 @@
                    (require-handle device "Create Life pipelines")
                    (require-handle state "Create Life state")
                    (setf queue (require-handle (get-queue device) "Get queue"))
-                   (when (minusp (update-surface device surface width height))
-                     (error "Configure surface failed"))
+                   (setf present-mode
+                         (configure-surface device surface state width height
+                                            present-mode))
                    (setf configured t
                          last-time (get-internal-real-time)
                          stats-start last-time)
@@ -346,8 +393,9 @@
                                  (= event sdl2-ffi:+sdl-windowevent-size-changed+))
                          (setf width d1 height d2)
                          (when (and (plusp d1) (plusp d2))
-                           (when (minusp (update-surface device surface d1 d2))
-                             (error "Resize surface failed")))))
+                           (setf present-mode
+                                 (configure-surface device surface state d1 d2
+                                                    present-mode)))))
                      (:mousemotion (:x x :y y :xrel xrel :yrel yrel)
                        (setf mouse-x (float x 1.0f0) mouse-y (float y 1.0f0))
                        (when dragging
@@ -388,6 +436,19 @@
                             (setf speed (next-speed-level speed)))
                            ((scancode-is keysym :scancode-down)
                             (setf speed (previous-speed-level speed)))
+                           ((scancode-is keysym :scancode-v)
+                            (setf present-mode
+                                  (configure-surface
+                                   device surface state width height
+                                   (if (eq present-mode :fifo)
+                                       :immediate
+                                       :fifo))
+                                  ;; 切替前後の値を同じ測定区間へ混ぜない。
+                                  stats-start (get-internal-real-time)
+                                  stats-generation generation
+                                  stats-frame-count 0
+                                  measured-speed 0.0d0
+                                  measured-fps 0.0d0))
                            ((scancode-is keysym :scancode-f)
                             (when (and (plusp width) (plusp height))
                               (let ((new-level (full-view-zoom-level width height)))
@@ -530,8 +591,12 @@
                            (setf last-title now)
                            (%set-window-title
                             (autowrap:ptr window)
-                            (format nil "Life 20000² | ~:[DENSE~;SPARSE~] | gen ~:D | ~:[RUN~;PAUSE~] | target ~A gen/s | actual ~,1F gen/s | ~,1F fps | zoom ~,1F cell/px"
-                                    *sparse-mode* generation paused
+                            (format nil "Life 20000² | ~:[DENSE~;SPARSE~] | ~A | gen ~:D | ~:[RUN~;PAUSE~] | target ~A gen/s | actual ~,1F gen/s | ~,1F fps | zoom ~,1F cell/px"
+                                    *sparse-mode*
+                                    (if (eq present-mode :immediate)
+                                        "IMMEDIATE"
+                                        "FIFO")
+                                    generation paused
                                     (if (= speed 192.0d0)
                                         "*192*"
                                         (format nil "~,1F" speed))

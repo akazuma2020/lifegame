@@ -34,6 +34,9 @@ const SPEED_LEVELS = Object.freeze([
   10, 20, 30, 40, 50, 60, 70, 80, 90, 100,
   110, 120, 130, 140, 150, 160, 170, 180, 190, 192, 200,
   210, 220, 230, 240, 250, 260, 270, 280, 290, 300,
+  400, 500, 600, 700, 800, 900, 1000,
+  2000, 3000, 4000, 5000,
+  6000, 7000, 8000, 9000, 10000,
 ]);
 
 const canvas = document.querySelector("#life");
@@ -175,7 +178,7 @@ function snapshotInfo(date) {
   const hh = String(hour).padStart(2, "0");
   const mm = String(snapshotMinute).padStart(2, "0");
   return {
-    url: `clock-snapshot/clock-${hh}-${mm}.rle`,
+    url: `clock-snapshot-ampm/clock-${hh}-${mm}.rle`,
     generation,
     originWallMs: date.getTime() - elapsedMs,
   };
@@ -861,7 +864,7 @@ async function main() {
   const startupDate = new Date();
   const source = syncToLocalTime
     ? snapshotInfo(startupDate)
-    : { url: "clock.rle", generation: 0, originWallMs: startupDate.getTime() };
+    : { url: "clock-ampm.rle", generation: 0, originWallMs: startupDate.getTime() };
 
   state.syncing = syncToLocalTime;
   state.speed = syncToLocalTime ? CLOCK_GENERATIONS_PER_SECOND : 50;
@@ -876,7 +879,7 @@ async function main() {
     fetchText("shader.wgsl", "WGSL"),
     fetchText(source.url, "時計RLE").catch((error) => {
       if (syncToLocalTime) {
-        throw new Error(`${error.message}\nclock-snapshot.zipをlifegame直下へ展開してください。`);
+        throw new Error(`${error.message}\nclock-snapshot-ampm/をlifegame直下へ展開するか、hashlife/generate-snapshots.shで生成してください。`);
       }
       throw error;
     }),
