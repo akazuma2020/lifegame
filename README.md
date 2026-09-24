@@ -3,7 +3,7 @@
 SBCL + wgpu-native で動く、20,000 x 20,000セルの Conway's Game of Life の実験です。
 本プロジェクトは、OpenAI Codex の支援を受けて開発しました。
 
-初期配置には [AM/PM両対応デジタル時計](https://codegolf.stackexchange.com/questions/88783/build-a-digital-clock-in-conways-game-of-life)
+初期配置には[AM/PM両対応デジタル時計](https://codegolf.stackexchange.com/questions/88783/build-a-digital-clock-in-conways-game-of-life)
 （10,284 x 6,796、B3/S23）を改造したものを使います。
 
 ## 構成図
@@ -14,7 +14,10 @@ SBCL + wgpu-native で動く、20,000 x 20,000セルの Conway's Game of Life �
 の順に読むと、CPUからGPUへ処理が渡る流れを追いやすくなります。
 主要ソースには自分の理解のためにかなり冗長なコメントをつけています。
 
-比較のため、同等機能を chrome で動かすための test_chrome.html、test_chrome.js も入れてあります。
+比較のため、同等機能を chrome で動作させる test_chrome.html、test_chrome.js も入れてあります。
+
+他の wgsl も手軽に試せる土台になるよう bridge.c の役割分担を見直しているところです。
+
 
 ## 必要環境
 

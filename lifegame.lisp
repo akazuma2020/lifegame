@@ -1,3 +1,4 @@
+(declaim (optimize (speed 3) (safety 0) (debug 0)))
 (ql:quickload :cffi)
 
 ;; 実行時ライブラリはOSの標準ローダー検索経路から解決する。
@@ -91,17 +92,6 @@
 (cffi:defcfun ("WGPU_SetPresentMode" set-present-mode) :int
   (device :pointer) (surface :pointer) (state :pointer)
   (width :uint32) (height :uint32) (request-immediate :uint32))
-(cffi:defcfun ("WGPU_AdvanceLife" advance-life) :int
-  (device :pointer) (queue :pointer) (state :pointer)
-  (steps :uint32) (sparse-mode :uint32))
-(cffi:defcfun ("WGPU_DrawLife" draw-life) :int
-  (device :pointer) (queue :pointer) (surface :pointer) (state :pointer)
-  (width :float) (height :float) (center-x :float) (center-y :float)
-  (zoom :float) (steps :uint32) (sparse-mode :uint32))
-(cffi:defcfun ("WGPU_ResetLife" %reset-life) :void
-  (queue :pointer) (state :pointer) (initial-words :pointer)
-  (word-count :uint64)
-  (initial-active-tiles :pointer) (initial-tile-count :uint32))
 (cffi:defcfun ("WGPU_ReleaseLife" release-life) :void (state :pointer))
 (cffi:defcfun ("wgpuDeviceGetQueue" get-queue) :pointer (device :pointer))
 (cffi:defcfun ("wgpuQueueRelease" release-queue) :void (queue :pointer))
@@ -115,23 +105,283 @@
   (window :pointer) (title :string))
 (cffi:defcfun ("SDL_ShowWindow" %show-window) :void (window :pointer))
 
+
+(defun require-handle (handle description)
+  (when (cffi:null-pointer-p handle)
+    (error "~A failed" description))
+  handle)
+
+;;; -------------------- GPU実験で共通に使う短いbridge API --------------------
+;; Lispは「何をするか」をcommand配列に書く。
+;; bridge.cは、その配列をまとめてwgpu-nativeへ渡す。
+;; こうすると、LispとCを何度も往復せずにすむ。
+
+(cffi:defcstruct life-state
+  ;; この並びはbridge.cのLifeStateと同じにする。
+  (render-pipeline :pointer)
+  (step-one-pipeline :pointer)
+  (step-eight-pipeline :pointer)
+  (clear-pipeline :pointer)
+  (uniforms :pointer)
+  (cells :pointer :count 2)
+  (tile-flags :pointer :count 2)
+  (active-tiles :pointer :count 2)
+  (indirect-args :pointer :count 2)
+  (render-groups :pointer :count 2)
+  (step-one-groups :pointer :count 2)
+  (step-eight-groups :pointer :count 2)
+  (clear-groups :pointer :count 2)
+  (current :uint32)
+  (present-mode :uint32)
+  (immediate-supported :boolean))
+
+(cffi:defcstruct wgpu-bridge-compute-command
+  ;; opcodeは命令の種類。残りのfieldは命令に必要な値を入れる箱。
+  (opcode :uint32)
+  (x :uint32)
+  (y :uint32)
+  (z :uint32)
+  (offset :uint64)
+  (size :uint64)
+  (object :pointer)
+  (argument :pointer))
+
+(cffi:defcfun ("WGPU_RunComputeCommands" run-compute-commands) :int
+  (device :pointer) (queue :pointer)
+  (commands :pointer) (command-count :uint32) (wait :uint32))
+
+(cffi:defcfun ("WGPU_RunComputeRenderFrame" run-compute-render-frame) :int
+  (device :pointer) (queue :pointer) (surface :pointer)
+  (commands :pointer) (command-count :uint32)
+  (pipeline :pointer) (bind-group :pointer)
+  (clear-r :double) (clear-g :double) (clear-b :double) (clear-a :double))
+
+(cffi:defcfun ("wgpuQueueWriteBuffer" wgpu-queue-write-buffer) :void
+  (queue :pointer) (buffer :pointer) (buffer-offset :uint64)
+  (data :pointer) (size :size))
+
+(defconstant +uniform-bytes+ 48)
+(defconstant +grid-bytes+ (* +word-count+ 4))
+(defconstant +tile-buffer-bytes+ (* +tile-count+ 4))
+(defconstant +indirect-bytes+ 12)
+
+;; bridge.cと同じ命令番号。
+(defconstant +compute-clear-buffer+ 1)
+(defconstant +compute-begin-pass+ 2)
+(defconstant +compute-set-pipeline+ 3)
+(defconstant +compute-set-bind-group+ 4)
+(defconstant +compute-dispatch+ 5)
+(defconstant +compute-dispatch-indirect+ 6)
+(defconstant +compute-end-pass+ 7)
+
+(defun state-slot (state slot &optional index)
+  "LifeStateからGPU handleや数値を1個読む。"
+  (if index
+      (cffi:mem-aref
+       (cffi:foreign-slot-pointer state '(:struct life-state) slot)
+       :pointer index)
+      (cffi:foreign-slot-value state '(:struct life-state) slot)))
+
+(defun (setf state-slot) (value state slot &optional index)
+  "LifeStateへGPU handleや数値を1個書く。"
+  (if index
+      (setf (cffi:mem-aref
+             (cffi:foreign-slot-pointer state '(:struct life-state) slot)
+             :pointer index)
+            value)
+      (setf (cffi:foreign-slot-value state '(:struct life-state) slot) value)))
+
+(defun write-uniforms (queue state width height center-x center-y zoom sparse-mode)
+  "画面の大きさやcamera位置など、shaderが毎frame読む値を送る。"
+  (cffi:with-foreign-object (data :uint8 +uniform-bytes+)
+    (dotimes (i +uniform-bytes+)
+      (setf (cffi:mem-aref data :uint8 i) 0))
+    (setf (cffi:mem-ref data :float 0) width
+          (cffi:mem-ref data :float 4) height
+          (cffi:mem-ref data :float 8) zoom
+          (cffi:mem-ref data :float 16) center-x
+          (cffi:mem-ref data :float 20) center-y
+          (cffi:mem-ref data :uint32 32) +grid-width+
+          (cffi:mem-ref data :uint32 36) +grid-height+
+          (cffi:mem-ref data :uint32 40) +words-per-row+
+          (cffi:mem-ref data :uint32 44) (if sparse-mode 1 0))
+    (wgpu-queue-write-buffer
+     queue (state-slot state 'uniforms) 0 data +uniform-bytes+)))
+
+(defun command-at (commands index)
+  "command配列のINDEX番目を指すpointerを返す。"
+  (cffi:mem-aptr commands '(:struct wgpu-bridge-compute-command) index))
+
+(defun set-command (commands index opcode
+                    &key (x 0) (y 0) (z 0) (offset 0) (size 0)
+                         (object (cffi:null-pointer)))
+  "commandを1個作る。使わないfieldには0かNULLを入れる。"
+  (let ((command (command-at commands index)))
+    (setf (cffi:foreign-slot-value
+           command '(:struct wgpu-bridge-compute-command) 'opcode) opcode
+          (cffi:foreign-slot-value
+           command '(:struct wgpu-bridge-compute-command) 'x) x
+          (cffi:foreign-slot-value
+           command '(:struct wgpu-bridge-compute-command) 'y) y
+          (cffi:foreign-slot-value
+           command '(:struct wgpu-bridge-compute-command) 'z) z
+          (cffi:foreign-slot-value
+           command '(:struct wgpu-bridge-compute-command) 'offset) offset
+          (cffi:foreign-slot-value
+           command '(:struct wgpu-bridge-compute-command) 'size) size
+          (cffi:foreign-slot-value
+           command '(:struct wgpu-bridge-compute-command) 'object) object
+          (cffi:foreign-slot-value
+           command '(:struct wgpu-bridge-compute-command) 'argument)
+          (cffi:null-pointer))))
+
+(defun life-batch-count (steps)
+  "8世代ずつ進め、最後に余った世代を1世代ずつ進める回数。"
+  (+ (floor steps 8) (mod steps 8)))
+
+(defun life-command-count (steps sparse-mode)
+  "必要なcommand数を先に数え、ちょうどよい大きさの配列を作れるようにする。"
+  (* (life-batch-count steps) (if sparse-mode 12 7)))
+
+(defun fill-life-commands (commands state steps sparse-mode)
+  "Lifeの更新手順を汎用command配列へ書き、次の面番号を返す。"
+  (let ((index 0)
+        (current (state-slot state 'current)))
+    (labels ((emit (opcode &rest arguments)
+               (apply #'set-command commands index opcode arguments)
+               (incf index)))
+      (loop while (plusp steps)
+            for batch = (if (>= steps 8) 8 1)
+            for next = (logxor current 1)
+            for pipeline =
+              (state-slot state
+                          (if (= batch 8)
+                              'step-eight-pipeline
+                              'step-one-pipeline))
+            for groups =
+              (if (= batch 8) 'step-eight-groups 'step-one-groups)
+            do
+               ;; 次に使う面へ残っている古い印を消す。
+               (emit +compute-clear-buffer+
+                     :object (state-slot state 'tile-flags next)
+                     :size +tile-buffer-bytes+)
+
+               ;; SPARSEでは、前回使ったtileだけを先に空にする。
+               (when sparse-mode
+                 (emit +compute-begin-pass+)
+                 (emit +compute-set-pipeline+
+                       :object (state-slot state 'clear-pipeline))
+                 (emit +compute-set-bind-group+
+                       :object (state-slot state 'clear-groups next))
+                 (emit +compute-dispatch-indirect+
+                       :object (state-slot state 'indirect-args next))
+                 (emit +compute-end-pass+))
+
+               ;; 次の候補数を0へ戻してからLifeを計算する。
+               (emit +compute-clear-buffer+
+                     :object (state-slot state 'indirect-args next)
+                     :size 4)
+               (emit +compute-begin-pass+)
+               (emit +compute-set-pipeline+ :object pipeline)
+               (emit +compute-set-bind-group+
+                     :object (state-slot state groups current))
+               (if sparse-mode
+                   (emit +compute-dispatch-indirect+
+                         :object (state-slot state 'indirect-args current))
+                   (emit +compute-dispatch+ :x +tile-count+ :y 1 :z 1))
+               (emit +compute-end-pass+)
+
+               (setf current next)
+               (decf steps batch))
+      (values index current))))
+
+(defun call-with-life-commands (state steps sparse-mode function)
+  "Life commandを作り、FUNCTIONへ渡す。成功したときだけ面番号を進める。"
+  (let ((count (life-command-count steps sparse-mode)))
+    (if (zerop count)
+        (funcall function (cffi:null-pointer) 0
+                 (state-slot state 'current))
+        (cffi:with-foreign-object
+            (commands '(:struct wgpu-bridge-compute-command) count)
+          (multiple-value-bind (actual-count next-current)
+              (fill-life-commands commands state steps sparse-mode)
+            (unless (= actual-count count)
+              (error "Life command count mismatch: expected ~D, got ~D"
+                     count actual-count))
+            (let ((result (funcall function commands count next-current)))
+              (when (zerop result)
+                (setf (state-slot state 'current) next-current))
+              result))))))
+
+(defun advance-life (device queue state steps sparse-mode)
+  "描画せずにSTEPS世代進める。起動時の早送りでも使う。"
+  (write-uniforms queue state 0.0f0 0.0f0 0.0f0 0.0f0 0.0f0
+                  (not (zerop sparse-mode)))
+  (call-with-life-commands
+   state steps (not (zerop sparse-mode))
+   (lambda (commands count next-current)
+     (declare (ignore next-current))
+     (run-compute-commands device queue commands count 1))))
+
+(defun reset-life (queue state initial-words active-tiles)
+  "最初の盤面と候補tileを、GPUの2面へ同じように入れ直す。"
+  (let ((count (length active-tiles)))
+    (cffi:with-foreign-object (indirect :uint32 3)
+      (setf (cffi:mem-aref indirect :uint32 0) count
+            (cffi:mem-aref indirect :uint32 1) 1
+            (cffi:mem-aref indirect :uint32 2) 1)
+      (cffi:with-pointer-to-vector-data (words-pointer initial-words)
+        (dotimes (i 2)
+          (wgpu-queue-write-buffer
+           queue (state-slot state 'cells i) 0 words-pointer +grid-bytes+)
+          (wgpu-queue-write-buffer
+           queue (state-slot state 'indirect-args i) 0
+           indirect +indirect-bytes+)))
+      (when (plusp count)
+        (cffi:with-pointer-to-vector-data (tiles-pointer active-tiles)
+          (dotimes (i 2)
+            (wgpu-queue-write-buffer
+             queue (state-slot state 'active-tiles i) 0
+             tiles-pointer (* count 4))))))
+    (setf (state-slot state 'current) 0)))
+
+(defun draw-life (device queue surface state width height center-x center-y zoom
+                  steps sparse-mode)
+  "Lifeを進め、その結果を1frame描いて画面へ出す。"
+  (let ((sparse-p (not (zerop sparse-mode))))
+    (write-uniforms queue state width height center-x center-y zoom sparse-p)
+    (let ((result
+            (call-with-life-commands
+             state steps sparse-p
+             (lambda (commands count next-current)
+               (run-compute-render-frame
+                device queue surface commands count
+                (state-slot state 'render-pipeline)
+                (state-slot state 'render-groups next-current)
+                0.008d0 0.011d0 0.015d0 1.0d0)))))
+      ;; Surfaceが古くなったときは、次のframeに備えて設定し直す。
+      (when (= result 1)
+        (set-present-mode device surface state
+                          (truncate width) (truncate height)
+                          (if (= (state-slot state 'present-mode) 3) 1 0)))
+      result)))
+
 ;;; -------------------- 実行時設定 --------------------
 (defparameter *window-title* "WGPU Life 20000 x 20000")
 (defparameter *window-width* 1200)
 (defparameter *window-height* 800)
 (defparameter *window-x* 80)
 (defparameter *window-y* 80)
+
 (defparameter *speed-levels*
   #(1.0d0 2.0d0 3.0d0 4.0d0 5.0d0
-    10.0d0 20.0d0 30.0d0 40.0d0 50.0d0
-    60.0d0 70.0d0 80.0d0 90.0d0 100.0d0
-    110.0d0 120.0d0 130.0d0 140.0d0 150.0d0
-    160.0d0 170.0d0 180.0d0 190.0d0 192.0d0 200.0d0
-    210.0d0 220.0d0 230.0d0 240.0d0 250.0d0
-    260.0d0 270.0d0 280.0d0 290.0d0 300.0d0
-    400.0d0 500.0d0 600.0d0 700.0d0 800.0d0 900.0d0 1000.0d0
-    2000.0d0 3000.0d0 4000.0d0 5000.0d0
-    6000.0d0 7000.0d0 8000.0d0 9000.0d0 10000.0d0))
+    10.0d0 20.0d0 30.0d0 40.0d0 50.0d0 60.0d0 70.0d0 80.0d0 90.0d0 100.0d0
+    110.0d0 120.0d0 130.0d0 140.0d0 150.0d0 160.0d0 170.0d0 180.0d0 190.0d0 192.0d0 200.0d0
+    300.0d0 400.0d0 500.0d0 600.0d0 700.0d0 800.0d0 900.0d0 1000.0d0
+    1100.0d0 1200.0d0 1300.0d0 1400.0d0 1500.0d0 1600.0d0 1700.0d0 1800.0d0 1900.0d0 2000.0d0
+    2100.0d0 2200.0d0 2300.0d0 2400.0d0 2500.0d0 2600.0d0 2700.0d0 2800.0d0 2900.0d0 3000.0d0
+    4000.0d0 5000.0d0 6000.0d0 7000.0d0 8000.0d0 9000.0d0 10000.0d0))
+
 (defparameter *initial-speed* 50.0d0)
 (defparameter *sparse-mode* t)
 (defparameter *present-mode* :fifo)
@@ -140,10 +390,6 @@
 (defparameter *auto-start*
   (not (string= (or (uiop:getenv "LIFEGAME_NO_AUTOSTART") "") "1")))
 
-(defun require-handle (handle description)
-  (when (cffi:null-pointer-p handle)
-    (error "~A failed" description))
-  handle)
 
 ;;; -------------------- RLEと時計スナップショット --------------------
 (defun ensure-clock-rle ()
@@ -248,13 +494,7 @@
           finally (return +max-zoom-level+))))
 
 (defun reset-gpu-grid (queue state words active-tiles)
-  (cffi:with-pointer-to-vector-data (words-pointer words)
-    (if (zerop (length active-tiles))
-        (%reset-life queue state words-pointer +word-count+
-                     (cffi:null-pointer) 0)
-        (cffi:with-pointer-to-vector-data (tiles-pointer active-tiles)
-          (%reset-life queue state words-pointer +word-count+
-                       tiles-pointer (length active-tiles))))))
+  (reset-life queue state words active-tiles))
 
 (defun scancode-is (keysym code)
   (sdl2:scancode= (sdl2:scancode-value keysym) code))

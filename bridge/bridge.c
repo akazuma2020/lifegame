@@ -64,6 +64,190 @@
 #define LIFE_API
 #endif
 
+/* -------------------- Lispから使う汎用command batch -------------------- */
+/*
+ * Lispからwgpu-nativeを1命令ずつ呼ぶと、LispとCを何度も往復する。
+ * そこで、Lispは「やることリスト」だけを作り、Cがまとめて実行する。
+ * この仕組みはLife専用ではなく、別のCompute実験でも使える。
+ */
+typedef enum {
+    WGPU_BRIDGE_COMPUTE_CLEAR_BUFFER = 1,
+    WGPU_BRIDGE_COMPUTE_BEGIN_PASS = 2,
+    WGPU_BRIDGE_COMPUTE_SET_PIPELINE = 3,
+    WGPU_BRIDGE_COMPUTE_SET_BIND_GROUP = 4,
+    WGPU_BRIDGE_COMPUTE_DISPATCH = 5,
+    WGPU_BRIDGE_COMPUTE_DISPATCH_INDIRECT = 6,
+    WGPU_BRIDGE_COMPUTE_END_PASS = 7
+} WGPUBridgeComputeOpcode;
+
+typedef struct {
+    uint32_t opcode;
+    uint32_t x;
+    uint32_t y;
+    uint32_t z;
+    uint64_t offset;
+    uint64_t size;
+    void *object;
+    void *argument;
+} WGPUBridgeComputeCommand;
+
+LIFE_API int WGPU_EncodeComputeCommands(
+    WGPUCommandEncoder encoder,
+    const WGPUBridgeComputeCommand *commands,
+    uint32_t command_count)
+{
+    if (!encoder || (!commands && command_count)) return -1;
+
+    WGPUComputePassEncoder pass = NULL;
+    for (uint32_t i = 0; i < command_count; i++) {
+        const WGPUBridgeComputeCommand *command = &commands[i];
+        switch ((WGPUBridgeComputeOpcode)command->opcode) {
+        case WGPU_BRIDGE_COMPUTE_CLEAR_BUFFER:
+            if (pass || !command->object || !command->size) goto fail;
+            wgpuCommandEncoderClearBuffer(
+                encoder, (WGPUBuffer)command->object,
+                command->offset, command->size);
+            break;
+        case WGPU_BRIDGE_COMPUTE_BEGIN_PASS:
+            if (pass) goto fail;
+            pass = wgpuCommandEncoderBeginComputePass(encoder, NULL);
+            if (!pass) goto fail;
+            break;
+        case WGPU_BRIDGE_COMPUTE_SET_PIPELINE:
+            if (!pass || !command->object) goto fail;
+            wgpuComputePassEncoderSetPipeline(
+                pass, (WGPUComputePipeline)command->object);
+            break;
+        case WGPU_BRIDGE_COMPUTE_SET_BIND_GROUP:
+            if (!pass || !command->object) goto fail;
+            wgpuComputePassEncoderSetBindGroup(
+                pass, command->x, (WGPUBindGroup)command->object, 0, NULL);
+            break;
+        case WGPU_BRIDGE_COMPUTE_DISPATCH:
+            if (!pass || !command->x || !command->y || !command->z) goto fail;
+            wgpuComputePassEncoderDispatchWorkgroups(
+                pass, command->x, command->y, command->z);
+            break;
+        case WGPU_BRIDGE_COMPUTE_DISPATCH_INDIRECT:
+            if (!pass || !command->object) goto fail;
+            wgpuComputePassEncoderDispatchWorkgroupsIndirect(
+                pass, (WGPUBuffer)command->object, command->offset);
+            break;
+        case WGPU_BRIDGE_COMPUTE_END_PASS:
+            if (!pass) goto fail;
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
+            pass = NULL;
+            break;
+        default:
+            goto fail;
+        }
+    }
+    if (pass) goto fail;
+    return 0;
+
+fail:
+    if (pass) wgpuComputePassEncoderRelease(pass);
+    return -1;
+}
+
+static int submit_encoder(WGPUDevice device, WGPUQueue queue,
+                          WGPUCommandEncoder encoder, bool wait)
+{
+    WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, NULL);
+    if (!command) return -1;
+
+    if (wait) {
+        WGPUSubmissionIndex index = wgpuQueueSubmitForIndex(queue, 1, &command);
+        wgpuCommandBufferRelease(command);
+        return wgpuDevicePoll(device, true, &index) ? 0 : -1;
+    }
+
+    wgpuQueueSubmit(queue, 1, &command);
+    wgpuCommandBufferRelease(command);
+    return 0;
+}
+
+LIFE_API int WGPU_RunComputeCommands(
+    WGPUDevice device, WGPUQueue queue,
+    const WGPUBridgeComputeCommand *commands,
+    uint32_t command_count, uint32_t wait)
+{
+    if (!device || !queue || (!commands && command_count)) return -1;
+
+    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, NULL);
+    if (!encoder) return -1;
+
+    int result = WGPU_EncodeComputeCommands(encoder, commands, command_count);
+    if (result == 0) result = submit_encoder(device, queue, encoder, wait != 0);
+    wgpuCommandEncoderRelease(encoder);
+    return result;
+}
+
+LIFE_API int WGPU_RunComputeRenderFrame(
+    WGPUDevice device, WGPUQueue queue, WGPUSurface surface,
+    const WGPUBridgeComputeCommand *commands, uint32_t command_count,
+    WGPURenderPipeline pipeline, WGPUBindGroup bind_group,
+    double clear_r, double clear_g, double clear_b, double clear_a)
+{
+    if (!device || !queue || !surface || !pipeline || !bind_group) return -1;
+    if (!commands && command_count) return -1;
+
+    WGPUSurfaceTexture surface_texture = WGPU_SURFACE_TEXTURE_INIT;
+    wgpuSurfaceGetCurrentTexture(surface, &surface_texture);
+    if (surface_texture.status == WGPUSurfaceGetCurrentTextureStatus_Timeout ||
+        surface_texture.status == WGPUSurfaceGetCurrentTextureStatus_Outdated ||
+        surface_texture.status == WGPUSurfaceGetCurrentTextureStatus_Lost) {
+        if (surface_texture.texture) wgpuTextureRelease(surface_texture.texture);
+        return 1;
+    }
+    if (!surface_texture.texture) return -1;
+
+    WGPUTextureView view = wgpuTextureCreateView(surface_texture.texture, NULL);
+    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, NULL);
+    if (!view || !encoder) goto fail;
+    if (WGPU_EncodeComputeCommands(encoder, commands, command_count) < 0) goto fail;
+
+    WGPURenderPassColorAttachment color =
+        WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+    color.view = view;
+    color.loadOp = WGPULoadOp_Clear;
+    color.storeOp = WGPUStoreOp_Store;
+    color.clearValue = (WGPUColor){clear_r, clear_g, clear_b, clear_a};
+
+    WGPURenderPassDescriptor descriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+    descriptor.colorAttachmentCount = 1;
+    descriptor.colorAttachments = &color;
+
+    WGPURenderPassEncoder pass =
+        wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+    if (!pass) goto fail;
+    wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+    wgpuRenderPassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
+    wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+    wgpuRenderPassEncoderEnd(pass);
+    wgpuRenderPassEncoderRelease(pass);
+
+    if (submit_encoder(device, queue, encoder, false) < 0) goto fail;
+
+    /*
+     * SurfaceのTextureを解放する前にpresentする。
+     * 先に解放すると、画面へ出すTextureがなくなり黒画面になる。
+     */
+    wgpuSurfacePresent(surface);
+
+    wgpuCommandEncoderRelease(encoder);
+    wgpuTextureViewRelease(view);
+    wgpuTextureRelease(surface_texture.texture);
+    return 0;
+
+fail:
+    if (encoder) wgpuCommandEncoderRelease(encoder);
+    if (view) wgpuTextureViewRelease(view);
+    wgpuTextureRelease(surface_texture.texture);
+    return -1;
+}
+
 /* -------------------- 盤面サイズとGPUバッファの大きさ -------------------- */
 #define GRID_WIDTH 20000u
 #define GRID_HEIGHT 20000u
